@@ -1,146 +1,138 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-import requests
-import time
-import threading
-import uuid
-import json
 import os
-
-DATA_FILE = 'targets.json'
+import json
+import uuid
+import requests
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 scheduler.start()
-lock = threading.Lock()
 
-# Khởi tạo file data nếu chưa có
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, 'w') as f:
-        json.dump({'targets': [], 'logs': {}}, f)
+DATA_FILE = "targets.json"
 
-
+# ----------------- Data Helpers -----------------
 def load_data():
-    with lock:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-
+    if not os.path.exists(DATA_FILE):
+        return {"targets": []}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def save_data(data):
-    with lock:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-
-def ping_target(target_id):
+def update_target(target_id, **kwargs):
     data = load_data()
-    targets = data.get('targets', [])
-    target = next((t for t in targets if t['id'] == target_id), None)
-    if not target:
-        return
-    url = target['url']
-    now = time.time()
-    entry = {'ts': now}
-    try:
-        start = time.time()
-        r = requests.get(url, timeout=10)
-        elapsed = time.time() - start
-        entry.update({'status': 'ok', 'code': r.status_code, 'time': round(elapsed, 3)})
-    except Exception as e:
-        entry.update({'status': 'error', 'error': str(e)})
-
-    # lưu log
-    data = load_data()
-    logs = data.setdefault('logs', {})
-    logs.setdefault(target_id, []).insert(0, entry)
-    if len(logs[target_id]) > 200:
-        logs[target_id] = logs[target_id][:200]
+    for t in data["targets"]:
+        if t["id"] == target_id:
+            for k, v in kwargs.items():
+                t[k] = v
+            break
     save_data(data)
 
+# ----------------- Ping Function -----------------
+def ping_target(target_id, url):
+    try:
+        r = requests.get(url, timeout=10)
+        status = r.status_code
+    except Exception as e:
+        status = f"Error: {e}"
 
-@app.route('/')
+    update_target(target_id,
+                  last_ping=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} → {status}")
+
+# ----------------- Routes -----------------
+@app.route("/", methods=["GET"])
 def index():
     data = load_data()
-    return render_template('index.html', targets=data.get('targets', []))
+    return render_template("index.html", targets=data.get("targets", []))
 
-
-@app.route('/add', methods=['POST'])
-def add():
-    url = request.form.get('url', '').strip()
-    label = request.form.get('label', '').strip() or url
-    interval = int(request.form.get('interval', '5'))
-    if not url:
-        return redirect(url_for('index'))
+@app.route("/add_target", methods=["POST"])
+def add_target():
     data = load_data()
-    tid = str(uuid.uuid4())
-    target = {'id': tid, 'url': url, 'label': label, 'interval': interval, 'running': False}
-    data.setdefault('targets', []).append(target)
+    url = request.form["url"]
+    label = request.form["label"]
+    interval = int(request.form["interval"])
+
+    new_target = {
+        "id": str(uuid.uuid4()),
+        "url": url,
+        "label": label,
+        "interval": interval,
+        "running": False,
+        "last_ping": None
+    }
+    data["targets"].append(new_target)
     save_data(data)
-    return redirect(url_for('index'))
+    return redirect(url_for("index"))
 
-
-@app.route('/start/<tid>', methods=['POST'])
-def start(tid):
+@app.route("/start/<target_id>")
+def start_target(target_id):
     data = load_data()
-    target = next((t for t in data.get('targets', []) if t['id'] == tid), None)
-    if not target:
-        return jsonify({'ok': False, 'error': 'not found'}), 404
-    if target.get('running'):
-        return jsonify({'ok': True})
-    trigger = IntervalTrigger(seconds=target.get('interval', 5))
-    scheduler.add_job(lambda: ping_target(tid), trigger, id=tid, replace_existing=True)
-    target['running'] = True
+    for t in data["targets"]:
+        if t["id"] == target_id:
+            scheduler.add_job(
+                ping_target,
+                "interval",
+                seconds=t["interval"],
+                args=[t["id"], t["url"]],
+                id=t["id"],
+                replace_existing=True
+            )
+            t["running"] = True
+            break
     save_data(data)
-    return jsonify({'ok': True})
+    return redirect(url_for("index"))
 
-
-@app.route('/stop/<tid>', methods=['POST'])
-def stop(tid):
+@app.route("/stop/<target_id>")
+def stop_target(target_id):
     try:
-        scheduler.remove_job(tid)
+        scheduler.remove_job(target_id)
     except Exception:
         pass
-    data = load_data()
-    target = next((t for t in data.get('targets', []) if t['id'] == tid), None)
-    if target:
-        target['running'] = False
-        save_data(data)
-    return jsonify({'ok': True})
+    update_target(target_id, running=False)
+    return redirect(url_for("index"))
 
-
-@app.route('/delete/<tid>', methods=['POST'])
-def delete(tid):
+@app.route("/ping/<target_id>")
+def ping_now(target_id):
     data = load_data()
-    data['targets'] = [t for t in data.get('targets', []) if t['id'] != tid]
-    if tid in data.get('logs', {}):
-        data['logs'].pop(tid)
+    for t in data["targets"]:
+        if t["id"] == target_id:
+            ping_target(t["id"], t["url"])
+            break
+    return redirect(url_for("index"))
+
+@app.route("/delete/<target_id>")
+def delete_target(target_id):
+    data = load_data()
+    data["targets"] = [t for t in data["targets"] if t["id"] != target_id]
+    save_data(data)
     try:
-        scheduler.remove_job(tid)
+        scheduler.remove_job(target_id)
     except Exception:
         pass
-    save_data(data)
-    return jsonify({'ok': True})
+    return redirect(url_for("index"))
 
+# ----------------- Self Ping -----------------
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL")
+if SELF_URL:
+    def ping_self():
+        try:
+            r = requests.get(SELF_URL, timeout=5)
+            print(f"[SELF PING] {SELF_URL} -> {r.status_code}")
+        except Exception as e:
+            print(f"[SELF PING ERROR] {e}")
 
-@app.route('/ping_now/<tid>', methods=['POST'])
-def ping_now(tid):
-    threading.Thread(target=ping_target, args=(tid,), daemon=True).start()
-    return jsonify({'ok': True})
+    scheduler.add_job(
+        ping_self,
+        trigger="interval",
+        seconds=300,  # mỗi 5 phút
+        id="self_ping",
+        replace_existing=True,
+    )
 
-
-@app.route('/logs/<tid>')
-def get_logs(tid):
-    data = load_data()
-    logs = data.get('logs', {}).get(tid, [])
-    return jsonify({'ok': True, 'logs': logs[:50]})
-
-
-@app.route('/list')
-def get_list():
-    data = load_data()
-    return jsonify({'targets': data.get('targets', [])})
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+# ----------------- Main -----------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
